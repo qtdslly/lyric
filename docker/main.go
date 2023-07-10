@@ -2,13 +2,17 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"log"
+	"lyric/common/logger"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"syscall"
 
 	"github.com/gokrazy/gokrazy"
+	"github.com/tidwall/gjson"
 )
 
 func podman(args ...string) error {
@@ -19,12 +23,13 @@ func podman(args ...string) error {
 	podman.Stdout = os.Stdout
 	podman.Stderr = os.Stderr
 	if err := podman.Run(); err != nil {
+		logger.Error(err)
 		return fmt.Errorf("%v: %v", podman.Args, err)
 	}
 	return nil
 }
 
-func irssi() error {
+func start() error {
 	// Ensure we have an up-to-date clock, which in turn also means that
 	// networking is up. This is relevant because podman takes what’s in
 	// /etc/resolv.conf (nothing at boot) and holds on to it, meaning your
@@ -32,39 +37,64 @@ func irssi() error {
 	gokrazy.WaitForClock()
 
 	if err := mountVar(); err != nil {
-		return err
-	}
-
-	if err := podman("kill", "irssi"); err != nil {
-		log.Print(err)
-	}
-
-	if err := podman("rm", "irssi"); err != nil {
-		log.Print(err)
-	}
-
-	// You could podman pull here.
-
-	if err := podman("run",
-		"-td",
-		"-v", "/perm/irssi:/home/michael/.irssi",
-		"-v", "/perm/irclogs:/home/michael/irclogs",
-		"-e", "TERM=rxvt-unicode",
-		"-e", "LANG=C.UTF-8",
-		"--network", "host",
-		"--name", "irssi",
-		"docker.io/stapelberg/irssi:latest",
-		"screen", "-S", "irssi", "irssi"); err != nil {
+		logger.Error(err)
 		return err
 	}
 
 	return nil
 }
 
+/*
+/user/podman run -itd --name nginx -p 8080:80 docker.io/library/nginx
+*/
 func main() {
-	if err := irssi(); err != nil {
-		log.Fatal(err)
+	if err := start(); err != nil {
+		logger.Error(err)
+		return
 	}
+}
+
+func getContainerId(name string) string {
+	data, err := ioutil.ReadFile("/var/lib/containers/storage/overlay-containers/containers.json")
+	if err != nil {
+		logger.Error(err)
+		return ""
+	}
+	contains := gjson.Parse(string(data)).Array()
+	for _, contain := range contains {
+		n := contain.Get("metadata.name").String()
+		if n == name {
+			return contain.Get("id").String()
+		}
+	}
+	return ""
+}
+func reStartService(name string) error {
+	podman("kill", name)
+
+	path := "/var/lib/cni/networks/podman"
+	files, err := ioutil.ReadDir(path)
+	if err != nil {
+		logger.Error(err)
+		return err
+	}
+
+	id := getContainerId(name)
+	for _, f := range files {
+		filePath := filepath.Join(path, f.Name())
+		data, _ := ioutil.ReadFile(filePath)
+		if strings.Contains(string(data), id) {
+			os.Remove(filePath)
+			break
+		}
+	}
+
+	if err := podman("start", name); err != nil {
+		logger.Error(err)
+		return err
+	}
+
+	return nil
 }
 
 // mountVar bind-mounts /perm/container-storage to /var if needed.
@@ -75,6 +105,7 @@ func mountVar() error {
 
 	b, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
+		logger.Error(err)
 		return err
 	}
 	for _, line := range strings.Split(strings.TrimSpace(string(b)), "\n") {
@@ -85,12 +116,13 @@ func mountVar() error {
 		mountpoint := parts[4]
 		log.Printf("Found mountpoint %q", parts[4])
 		if mountpoint == "/var" {
-			log.Printf("/var file system already mounted, nothing to do")
+			logger.Error("/var file system already mounted, nothing to do")
 			return nil
 		}
 	}
 
 	if err := syscall.Mount("/perm/container-storage", "/var", "", syscall.MS_BIND, ""); err != nil {
+		logger.Error(err)
 		return fmt.Errorf("mounting /perm/container-storage to /var: %v", err)
 	}
 
@@ -122,3 +154,14 @@ func expandPath(env []string) []string {
 	return env
 }
 
+/*
+	if err := podman("run",
+		"-itd",
+		"--name", "nginx",
+		"-p", "8080:80",
+		"docker.io/library/nginx"); err != nil {
+		logger.Error(err)
+		return err
+	}
+
+*/
